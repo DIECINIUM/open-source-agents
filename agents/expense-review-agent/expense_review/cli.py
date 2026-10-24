@@ -5,7 +5,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from .agent import ExpenseAgent, OllamaExtractor
+from .agent import ExpenseAgent, GeminiConfigurationError, GeminiExtractor
 from .connectors import DATA_HOME, DEFAULT_QUERY, authorize_gmail, fetch_gmail, read_keep
 from .ledger import Ledger
 
@@ -22,7 +22,7 @@ def main() -> int:
     keep = commands.add_parser("import-keep")
     keep.add_argument("path", type=Path)
     reason = commands.add_parser("reason")
-    reason.add_argument("--model", default="qwen3:4b")
+    reason.add_argument("--model", help="Gemini model ID; defaults to GEMINI_MODEL or the configured default")
     commands.add_parser("list")
     review = commands.add_parser("review")
     review.add_argument("candidate_id")
@@ -38,13 +38,14 @@ def main() -> int:
         print("Gmail connected with read-only access.")
         return 0
     ledger = Ledger(args.data_dir / "ledger.sqlite3")
-    agent = ExpenseAgent(ledger, OllamaExtractor(getattr(args, "model", "qwen3:4b")))
+    agent = ExpenseAgent(ledger)
     try:
         if args.command == "fetch-gmail":
             result = agent.ingest(fetch_gmail(args.data_dir / "gmail-token.json", args.query, args.limit))
         elif args.command == "import-keep":
             result = agent.ingest(read_keep(args.path))
         elif args.command == "reason":
+            agent.extractor = GeminiExtractor(args.model)
             result = asyncio.run(agent.reason())
         elif args.command == "list":
             result = ledger.snapshot()
@@ -55,6 +56,8 @@ def main() -> int:
             result = ledger.monthly(args.month)
         print(json.dumps(result, indent=2))
         return 1 if isinstance(result, dict) and result.get("errors") else 0
+    except GeminiConfigurationError as error:
+        parser.exit(1, f"{error}\n")
     except Exception as error:
         parser.exit(1, f"Operation failed ({type(error).__name__}). Check configuration and source access.\n")
 

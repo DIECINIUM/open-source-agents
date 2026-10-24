@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "expense-review-agent"
 version = "0.1.0"
-description = "Review-first expense extraction from Gmail and Google Keep using local Ollama"
+description = "Review-first expense extraction from Gmail and Google Keep using Gemini"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.11,<3",

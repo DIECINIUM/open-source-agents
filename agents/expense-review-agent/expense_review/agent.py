@@ -1,12 +1,20 @@
-"""Bounded, schema-constrained Ollama extraction; no model-controlled write tools."""
+"""Bounded, schema-constrained Gemini extraction; no model-controlled write tools."""
 
-import json
+import os
+import re
 from collections.abc import Awaitable, Callable
 
 import httpx
 
 from .ledger import Ledger
 from .models import Extraction, SourceNote
+
+
+DEFAULT_MODEL = "gemini-3.8-flash"
+
+
+class GeminiConfigurationError(ValueError):
+    """Required server-side Gemini configuration is missing."""
 
 
 SYSTEM_PROMPT = """You extract proposed financial transactions for a human review queue.
@@ -27,28 +35,52 @@ Transport, Shopping, Bills, Health, Personal loan, Salary or Other. Output only 
 JSON schema. You cannot approve, edit notes, send emails, initiate payments or execute code."""
 
 
-class OllamaExtractor:
-    def __init__(self, model: str = "qwen3:4b"):
-        if not model.strip() or len(model) > 120:
-            raise ValueError("Use a valid installed Ollama model tag")
-        self.model = model
+class GeminiExtractor:
+    def __init__(self, model: str | None = None):
+        self.model = model if model is not None else os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+        if not re.fullmatch(r"gemini-[A-Za-z0-9._-]{1,110}", self.model):
+            raise ValueError("Use a valid Gemini model ID without a URL or models/ prefix")
+        self._api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not self._api_key:
+            raise GeminiConfigurationError("Set GEMINI_API_KEY in the backend environment before reasoning")
 
     async def extract(self, note: SourceNote) -> Extraction:
         async with httpx.AsyncClient(timeout=90, trust_env=False) as client:
-            response = await client.post("http://127.0.0.1:11434/api/chat", json={
-                "model": self.model, "stream": False,
-                "format": Extraction.model_json_schema(),
-                "options": {"temperature": 0, "num_predict": 3000},
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                             {"role": "user", "content": json.dumps(note.model_dump())}],
-            })
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
+                headers={"x-goog-api-key": self._api_key},
+                json={
+                    "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                    "contents": [{"role": "user", "parts": [{"text": note.model_dump_json()}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 3000,
+                        "responseFormat": {"text": {
+                            "mimeType": "APPLICATION_JSON",
+                            "schema": Extraction.model_json_schema(),
+                        }},
+                    },
+                },
+            )
             response.raise_for_status()
             data = response.json()
-        return Extraction.model_validate_json(data["message"]["content"])
+        candidates = data.get("candidates") if isinstance(data, dict) else None
+        if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+            raise ValueError("Gemini returned no candidate; the response may have been blocked")
+        candidate = candidates[0]
+        if candidate.get("finishReason") != "STOP":
+            raise ValueError("Gemini did not return a complete, unblocked response")
+        content = candidate.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            raise ValueError("Gemini returned no response content")
+        text = "".join(part["text"] for part in parts
+                       if isinstance(part, dict) and isinstance(part.get("text"), str)
+                       and not part.get("thought"))
+        return Extraction.model_validate_json(text)
 
 
 class ExpenseAgent:
-    def __init__(self, ledger: Ledger, extractor: OllamaExtractor):
+    def __init__(self, ledger: Ledger, extractor: GeminiExtractor | None = None):
         self.ledger = ledger
         self.extractor = extractor
 
@@ -62,6 +94,8 @@ class ExpenseAgent:
                      limit: int = 20) -> dict:
         if not 1 <= limit <= 20:
             raise ValueError("Reasoning is limited to 1-20 notes per run")
+        if self.extractor is None:
+            raise ValueError("Configure a Gemini extractor before reasoning")
         processed = errors = proposed = 0
         notes = self.ledger.queued_notes()[:limit]
         for index, (note_id, note) in enumerate(notes):
@@ -73,9 +107,13 @@ class ExpenseAgent:
                 self.ledger.stage(note_id, extraction.transactions, extraction.explanation)
                 processed += 1
                 proposed += len(extraction.transactions)
+            except httpx.HTTPStatusError as error:
+                errors += 1
+                code = error.response.status_code
+                self.ledger.mark_error(note_id, f"Gemini returned HTTP {code}. Check API key permissions, model access, quota and billing.")
             except httpx.HTTPError:
                 errors += 1
-                self.ledger.mark_error(note_id, "Ollama request failed. Check the local service and installed model.")
+                self.ledger.mark_error(note_id, "Gemini request failed. Check network access and retry later.")
             except (ValueError, KeyError, TypeError):
                 errors += 1
                 self.ledger.mark_error(note_id, "Model output did not match the required transaction schema.")

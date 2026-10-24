@@ -1,13 +1,17 @@
 """Offline regressions for source ingestion and the human approval gate."""
 
 import asyncio
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import httpx
 from pydantic import ValidationError
 
-from expense_review.agent import ExpenseAgent
+from expense_review.agent import DEFAULT_MODEL, ExpenseAgent, GeminiConfigurationError, GeminiExtractor
 from expense_review.connectors import import_keep
 from expense_review.ledger import Ledger, guardrails
 from expense_review.models import Extraction, Proposal, SourceNote
@@ -108,6 +112,87 @@ class ExpenseReviewChecks(unittest.TestCase):
         self.assertEqual(result["errors"], 1)
         self.assertEqual(self.ledger.snapshot()["notes"][0]["state"], "error")
         self.assertEqual(self.ledger.monthly("2026-10")["approved_count"], 0)
+
+
+class GeminiExtractorChecks(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.note = SourceNote(source="manual", source_id="synthetic", title="Lunch",
+                               text="On 2026-10-20 I paid INR 250 for lunch.")
+        self.extraction = Extraction(transactions=[], explanation="No fixture transactions.")
+        environment = patch.dict(os.environ, {"GEMINI_API_KEY": "offline-dummy-key", "GEMINI_MODEL": DEFAULT_MODEL})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    async def extract_response(self, payload, status_code=200):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(status_code, json=payload),
+        ))
+        with patch("expense_review.agent.httpx.AsyncClient", return_value=client):
+            return await GeminiExtractor().extract(self.note)
+
+    async def test_https_request_uses_header_key_and_structured_output(self):
+        def respond(request):
+            self.assertEqual(request.url.scheme, "https")
+            self.assertEqual(request.url.host, "generativelanguage.googleapis.com")
+            self.assertEqual(request.url.query, b"")
+            self.assertNotIn("offline-dummy-key", str(request.url))
+            self.assertEqual(request.headers["x-goog-api-key"], "offline-dummy-key")
+            body = json.loads(request.content)
+            self.assertEqual(json.loads(body["contents"][0]["parts"][0]["text"]), self.note.model_dump())
+            self.assertEqual(body["generationConfig"]["maxOutputTokens"], 3000)
+            self.assertEqual(body["generationConfig"]["responseFormat"]["text"]["schema"], Extraction.model_json_schema())
+            return httpx.Response(200, json={"candidates": [{"finishReason": "STOP", "content": {"parts": [
+                {"text": "untrusted internal thought", "thought": True},
+                {"text": self.extraction.model_dump_json()},
+            ]}}]})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        with patch("expense_review.agent.httpx.AsyncClient", return_value=client):
+            result = await GeminiExtractor().extract(self.note)
+        self.assertEqual(result, self.extraction)
+
+    def test_missing_key_and_invalid_model_fail_before_network_access(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+            with self.assertRaisesRegex(GeminiConfigurationError, "GEMINI_API_KEY"):
+                GeminiExtractor()
+        for model in ("qwen3:4b", "../unexpected", "https://untrusted.example/model"):
+            with self.assertRaisesRegex(ValueError, "valid Gemini model"):
+                GeminiExtractor(model)
+
+    async def test_blocked_truncated_and_missing_candidates_are_rejected(self):
+        for payload in ({"promptFeedback": {"blockReason": "SAFETY"}},
+                        {"candidates": []},
+                        {"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [
+                            {"text": self.extraction.model_dump_json()},
+                        ]}}]}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    await self.extract_response(payload)
+
+    async def test_invalid_json_and_schema_output_are_rejected(self):
+        for text in ("not json", '{"transactions": [], "explanation": ""}'):
+            with self.subTest(text=text):
+                with self.assertRaises(ValidationError):
+                    await self.extract_response({"candidates": [{"finishReason": "STOP", "content": {
+                        "parts": [{"text": text}],
+                    }}]})
+
+    async def test_rate_limit_stays_in_error_queue_without_leaking_key(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ledger = Ledger(Path(folder) / "ledger.sqlite3")
+            agent = ExpenseAgent(ledger, GeminiExtractor())
+            agent.ingest([self.note])
+            client = httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda request: httpx.Response(429, json={"error": {"message": "private provider detail"}}),
+            ))
+            with patch("expense_review.agent.httpx.AsyncClient", return_value=client):
+                result = await agent.reason()
+            self.assertEqual(result["errors"], 1)
+            snapshot = ledger.snapshot()
+            self.assertEqual(snapshot["candidates"], [])
+            self.assertIn("HTTP 429", snapshot["notes"][0]["explanation"])
+            self.assertNotIn("offline-dummy-key", json.dumps(snapshot))
+            self.assertNotIn("private provider detail", json.dumps(snapshot))
 
 
 if __name__ == "__main__":
