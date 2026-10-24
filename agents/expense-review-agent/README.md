@@ -15,6 +15,39 @@ loan proceeds are not treated as earnings and lending is not treated as spending
 Monthly cashflow includes borrowing, lending, and repayments with their proper
 cash directions; transfers between the user's own accounts are excluded.
 
+## Why Use This Agent?
+
+Financial records often mix several different events: a purchase receipt, money
+lent to a friend, a loan received, and a repayment. Treating every debit as an
+expense or every credit as income produces misleading monthly totals. Copying
+these records into a spreadsheet also loses the original context behind an entry.
+
+This agent reduces that manual sorting while keeping the decision with you:
+
+- Collect relevant emails and exported notes into one local review queue.
+- Suggest transaction fields and tags from unstructured text using Gemini.
+- Preserve the original source, verbatim evidence, and a short classification reason.
+- Distinguish purchases from loans, repayments, income, and internal transfers.
+- Require human approval before a proposal affects the ledger.
+
+Gemini proposes an interpretation; Python validates it and the person reviewing
+the source decides whether it should count. This is useful when you want assisted
+bookkeeping without giving a model authority to approve financial records.
+
+## Where Is It Useful?
+
+| Situation | How the agent helps |
+| --- | --- |
+| Personal monthly expense review | Combines receipt emails and transaction notes, then totals approved spending by category. |
+| Informal lending and borrowing | Keeps money lent, loans received, and repayments separate from normal purchases and earnings. |
+| Shared expenses or reimbursements | Preserves who a note mentions and why a transaction was proposed so you can verify its direction. |
+| Learning or prototyping financial AI workflows | Demonstrates structured extraction, source evidence, deterministic guardrails, and a human approval gate. |
+
+It is not a bank connection, payment tool, tax-reporting system, or replacement
+for accounting software. It does not calculate outstanding loan balances or
+automatically match repayments to individual loans. Use it only where sending
+the selected financial source text to Google's Gemini API is acceptable.
+
 ## Technical Stack
 
 - Python 3.11+, Pydantic validation, HTTPX, and SQLite.
@@ -54,7 +87,14 @@ an export from https://takeout.google.com with Keep selected.
 
 ## Installation & Setup
 
-From the repository root:
+Clone the repository if you do not already have it:
+
+```bash
+git clone https://github.com/gdgcblr/open-source-agents.git
+cd open-source-agents
+```
+
+From the repository root, install only this agent:
 
 ```bash
 cd agents/expense-review-agent
@@ -80,6 +120,10 @@ your platform's server-side secret manager instead of an interactive prompt.
 On Windows, use `.venv\Scripts\Activate.ps1` for activation. Verified on macOS
 with Python 3.14; other platforms and the minimum runtime are not verified.
 
+The `expense-review` command is installed by this package. You do not need the
+research assistant, Node.js, a frontend, or the private companion backend to run
+the agent. Installation and offline tests do not require an API key or Google login.
+
 ## Configuration & Environment Variables
 
 `EXPENSE_DATA_DIR` optionally selects the private data directory; otherwise data
@@ -95,14 +139,31 @@ the ledger. `.env` files are not automatically loaded.
 
 ## How to Run
 
-Authorize Gmail locally once using the downloaded Desktop client credentials:
+### 1. Choose Your Source
+
+You can start with Gmail, a Keep export, or both. They are independent import
+routes; you do not need to connect Gmail to use Keep.
+
+For Gmail, enable Gmail API in your Google Cloud project, configure the OAuth
+consent screen, add your account as a test user if the app is in testing, and
+create an OAuth client with application type **Desktop app**. Save its downloaded
+JSON outside this repository. Then authorize your account locally:
 
 ```bash
 expense-review auth-gmail --credentials /absolute/private/path/client.json
 expense-review fetch-gmail --limit 20
+```
+
+The authorization command opens Google's browser consent page. After you approve
+read-only access, it saves a private token in the configured data directory.
+The default search looks for transaction-related messages from the last 45 days;
+use `expense-review fetch-gmail --query "YOUR_GMAIL_QUERY" --limit 20` to change it.
+
+For personal Google Keep, request a Keep export at https://takeout.google.com,
+download and extract it locally, then import one exported note JSON:
+
+```bash
 expense-review import-keep /absolute/path/to/Takeout/Keep/example.json
-expense-review reason
-expense-review list
 ```
 
 The browser consent requests `gmail.readonly`; no email is modified or sent.
@@ -111,19 +172,70 @@ not claim live personal Keep sync. Import one exported note JSON at a time, or
 a JSON array / `{"notes": [...]}` containing up to 100 note objects. A note can
 have `title`, `textContent`, and `listContent` checklist entries.
 
-Inspect a candidate's source, amount, date, direction, and classification. Use
-its ID from `list` to explicitly review it:
+### 2. Ask Gemini to Propose Transactions
+
+Set `GEMINI_API_KEY` privately as described above, then run:
+
+```bash
+expense-review reason
+expense-review list
+```
+
+Each reasoning run processes at most 20 queued or errored notes. Run it again for
+remaining notes. To choose another supported model, use
+`expense-review reason --model YOUR_GEMINI_MODEL_ID`. Model access depends on
+your Google project. The agent does not execute commands or approve transactions
+on behalf of Gemini.
+
+`list` returns JSON containing source notes, proposals, flags, and the review
+audit. A proposal includes date, amount, currency, direction, category,
+counterparty, evidence, confidence, and the reason it was suggested. A failed
+request or invalid model response leaves an error on the source note instead of
+silently counting a transaction.
+
+### 3. Review Before Counting
+
+Inspect the candidate's original source, amount, date, direction, category, and
+flags. Replace `CANDIDATE_ID` below with its `id` from `list`; write your own
+review note explaining the decision:
 
 ```bash
 expense-review review CANDIDATE_ID --action approved --note "Matched to the original transaction source."
+```
+
+To exclude an incorrect or irrelevant proposal:
+
+```bash
+expense-review review CANDIDATE_ID --action rejected --note "The source does not support this transaction."
+```
+
+Approval is blocked when required evidence, amount, direction, or INR currency
+checks fail. A low-confidence flag still needs careful human review. Rejection
+does not require resolving the proposal's blocking flags.
+
+### 4. Read the Approved Monthly Ledger
+
+```bash
 expense-review monthly 2026-10
 ```
+
+Replace `2026-10` with the month you want in `YYYY-MM` format. The JSON output
+contains approved totals per transaction kind, spending categories, the approved
+entry count, and net cashflow. Pending and rejected candidates never count.
 
 Use `--action rejected` to exclude a candidate permanently. If a duplicate warning
 is raised, verify the source and supply `--confirm-distinct` only for genuinely
 different transactions. Corrections are available through the Python `Ledger.review`
 API; the CLI only reviews existing proposals. The optional companion dashboard
 and its Python backend are deliberately outside this repository.
+
+To keep a run's data separate, pass the global data-directory option **before**
+the subcommand and use the same directory for each step:
+
+```bash
+expense-review --data-dir /absolute/private/path/expense-data list
+expense-review --data-dir /absolute/private/path/expense-data monthly 2026-10
+```
 
 ## Example Input & Output
 
